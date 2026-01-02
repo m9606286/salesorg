@@ -2,108 +2,81 @@ import streamlit as st
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+import os
 
-st.set_page_config(page_title="晨暉業務系統", layout="wide")
+st.set_page_config(page_title="業務組織圖", layout="wide")
 
-st.title("📊 晨暉業務組織系統")
-st.caption("用身分證號登入｜內勤可依營業處篩選｜agent只看自己與下線")
+# ----------- Excel 讀取 ----------------
+EXCEL_FILE = "agents.xlsx"
 
-# ===== 讀取 Excel =====
-@st.cache_data
-def load_data():
-    return pd.read_excel("agents.xlsx")
-
-df = load_data()
-
-# ===== Session =====
-if "login" not in st.session_state:
-    st.session_state.login = False
-
-# ===== 登入畫面 =====
-if not st.session_state.login:
-    st.subheader("🔐 系統登入")
-    id_input = st.text_input("請輸入身分證號", placeholder="A123456789").strip().upper()
-
-    if st.button("登入"):
-        # 用身分證號登入
-        user = df[df["身分證字號"] == id_input]
-
-        if user.empty:
-            st.error("查無此身分證號")
-        else:
-            st.session_state.login = True
-            st.session_state.user = user.iloc[0].to_dict()
-            st.experimental_rerun()
-
+if not os.path.exists(EXCEL_FILE):
+    st.error(f"找不到 Excel 檔案: {EXCEL_FILE}，請上傳到專案根目錄")
     st.stop()
 
-# ===== 已登入 =====
-user = st.session_state.user
-st.sidebar.success(f"登入成功：{user['業務']}")
-st.sidebar.write(f"角色：{user.get('角色','agent')}")
+df = pd.read_excel(EXCEL_FILE)
 
-if st.sidebar.button("登出"):
-    st.session_state.clear()
-    st.experimental_rerun()
+# ----------- 登入 ----------------
+st.title("業務組織系統")
+user_id = st.text_input("請輸入身分證字號登入:")
 
-# ===== 內勤 / 管理員可篩選營業處 =====
-role = user.get("角色","agent")
-if role in ["admin","staff"]:
-    sales_dept_options = df["營業處"].unique().tolist()
-    selected_dept = st.sidebar.multiselect("選擇營業處篩選", sales_dept_options, default=sales_dept_options)
-    df_filtered = df[df["營業處"].isin(selected_dept)]
-else:
-    df_filtered = df.copy()  # agent 就看全部資料，但後面組織圖會限制
+if user_id:
+    user_row = df[df["身分證字號"] == user_id]
+    if user_row.empty:
+        st.error("身分證字號不存在！")
+        st.stop()
+    else:
+        role = user_row.iloc[0]["角色"]
+        user_name = user_row.iloc[0]["業務"]
+        st.success(f"歡迎 {user_name} ({role}) 登入")
 
-# ===== 建立組織圖 =====
-G = nx.DiGraph()
+        # ----------- 內勤可篩選營業處 ----------
+        if role == "staff":
+            branch_options = df["營業處"].unique()
+            branch_select = st.multiselect("篩選營業處", branch_options, default=branch_options)
+            df_filtered = df[df["營業處"].isin(branch_select)]
+        else:
+            # agent 只能看到自己和下線
+            def get_subordinates(df, user_id):
+                subs = df[df["直屬身分證字號"] == user_id]["身分證字號"].tolist()
+                all_ids = [user_id]
+                for sub in subs:
+                    all_ids += get_subordinates(df, sub)
+                return all_ids
+            visible_ids = get_subordinates(df, user_id)
+            df_filtered = df[df["身分證字號"].isin(visible_ids)]
 
-for _, row in df_filtered.iterrows():
-    # 節點用身分證號，顯示姓名（業務）
-    G.add_node(row["身分證字號"], label=row["業務"])
+        # ----------- 組織圖 ----------------
+        G = nx.DiGraph()
+        for _, row in df_filtered.iterrows():
+            G.add_node(row["身分證字號"], label=row["業務"])
+        for _, row in df_filtered.iterrows():
+            if pd.notna(row["直屬身分證字號"]):
+                G.add_edge(row["直屬身分證字號"], row["身分證字號"])
 
-for _, row in df_filtered.iterrows():
-    # 直屬身分證字號作為上級
-    if pd.notna(row["直屬身分證字號"]):
-        G.add_edge(row["直屬身分證字號"], row["身分證字號"])
+        # 樹狀層級排列
+        def hierarchy_pos(G, root=None):
+            if root is None:
+                # 找沒有上階的節點當 root
+                roots = [n for n,d in G.in_degree() if d==0]
+                if len(roots) == 0:
+                    root = list(G.nodes)[0]
+                else:
+                    root = roots[0]
+            pos = {}
+            def _hierarchy_pos(G, node, x=0, y=0, dx=1.0):
+                children = list(G.successors(node))
+                pos[node] = (x, y)
+                if len(children) != 0:
+                    width = dx / len(children)
+                    nextx = x - dx/2 - width/2
+                    for child in children:
+                        nextx += width
+                        _hierarchy_pos(G, child, nextx, y-1, width)
+            _hierarchy_pos(G, root)
+            return pos
 
-# ===== 權限判斷 =====
-if role in ["admin","staff"]:
-    visible_nodes = list(G.nodes)
-else:
-    # agent 只看自己與下線
-    visible_nodes = nx.descendants(G, user["身分證字號"]) | {user["身分證字號"]}
-
-subG = G.subgraph(visible_nodes)
-
-# ===== 顯示組織圖 =====
-st.subheader("🌳 業務組織圖")
-
-plt.figure(figsize=(14,10))
-try:
-    pos = nx.nx_agraph.graphviz_layout(subG, prog="dot")
-except:
-    pos = nx.spring_layout(subG)
-
-labels = {n: G.nodes[n]['label'] for n in subG.nodes}
-
-nx.draw(
-    subG,
-    pos,
-    labels=labels,
-    node_size=2600,
-    node_color=[
-        "#FFD966" if n == user["身分證字號"] else "#A7C7E7"
-        for n in subG.nodes
-    ],
-    font_size=10,
-    font_weight="bold",
-    arrows=True
-)
-
-st.pyplot(plt)
-
-# ===== 管理員 / 內勤表格 =====
-if role in ["admin","staff"]:
-    st.subheader("📋 業務資料表")
-    st.dataframe(df_filtered)
+        pos = hierarchy_pos(G)
+        labels = nx.get_node_attributes(G, "label")
+        plt.figure(figsize=(12,6))
+        nx.draw(G, pos, with_labels=True, labels=labels, node_size=2000, node_color="skyblue", arrows=True)
+        st.pyplot(plt)
